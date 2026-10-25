@@ -9,8 +9,8 @@ from flask import Flask
 TELEGRAM_BOT_TOKEN = "8553506343:AAFUtxPSjXoC0H5ForsccaduEpsURMuUcaE"
 TELEGRAM_CHAT_ID = "5333453283"
 
-# আপনি যেসব কয়েন স্ক্যান করতে চান (এখানে আরও কয়েন যোগ করতে পারেন)
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "MUBARAKUSDT"]
+# আপনি যেসব কয়েন স্ক্যান করতে চান
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XAUTUSDT", "MUBARAKUSDT"]
 
 RRR = 2.0  # 1:2 Risk to Reward Ratio
 
@@ -35,10 +35,9 @@ def send_telegram_alert(text_msg):
         print(f"[Telegram Error]: {e}")
         return False
 
-# Bybit পাবলিক API (আন্তর্জাতিক ও লাইভ ডেটা সোর্স)
+# Bybit পাবলিক API
 def get_klines(symbol, interval, limit=30):
     try:
-        # Bybit: 60 = 1 hour, 5 = 5 minutes
         bybit_interval = "60" if interval == "1h" else "5"
         url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval={bybit_interval}&limit={limit}"
         headers = {"User-Agent": "Mozilla/5.0"}
@@ -48,7 +47,7 @@ def get_klines(symbol, interval, limit=30):
             data = res.json()
             if data.get("retCode") == 0 and "list" in data.get("result", {}):
                 raw_list = data["result"]["list"]
-                raw_list.reverse()  # সময় অনুযায়ী ক্রমান্বয়ে সাজানো
+                raw_list.reverse()
                 candles = []
                 for d in raw_list:
                     candles.append({
@@ -64,7 +63,6 @@ def get_klines(symbol, interval, limit=30):
         print(f"[Data Error for {symbol} - {interval}]: {e}")
         return []
 
-# একক কয়েন স্ক্যানিং ফাংশন
 def scan_single_symbol(symbol, last_alerts):
     h1 = get_klines(symbol, "1h", 5)
     m5 = get_klines(symbol, "5m", 25)
@@ -92,7 +90,7 @@ def scan_single_symbol(symbol, last_alerts):
     bullish_fvg = c0["low"] > c2["high"]
     bearish_fvg = c0["high"] < c2["low"]
     
-    # লিকুইডিটি সুইপ চেক (গত ৫টি ক্যান্ডেলে)
+    # লিকুইডিটি সুইপ চেক
     ssl_taken = False
     bsl_taken = False
     sweep_low = curr["low"]
@@ -121,7 +119,7 @@ def scan_single_symbol(symbol, last_alerts):
         msg = (
             f"🟢 <b>[{symbol}] SMC BUY (LONG) SIGNAL!</b> 🎯\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            f"🪙 <b>Coin:</b> #{symbol}\n"
+            f"🪙 <b>Market:</b> #{symbol}\n"
             f"💵 <b>Entry Price:</b> ${entry}\n"
             f"🛑 <b>Stop-Loss (SL):</b> ${sl}\n"
             f"🎯 <b>Take-Profit (TP 1:2):</b> ${tp}\n"
@@ -142,7 +140,7 @@ def scan_single_symbol(symbol, last_alerts):
         msg = (
             f"🔴 <b>[{symbol}] SMC SELL (SHORT) SIGNAL!</b> 🎯\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            f"🪙 <b>Coin:</b> #{symbol}\n"
+            f"🪙 <b>Market:</b> #{symbol}\n"
             f"💵 <b>Entry Price:</b> ${entry}\n"
             f"🛑 <b>Stop-Loss (SL):</b> ${sl}\n"
             f"🎯 <b>Take-Profit (TP 1:2):</b> ${tp}\n"
@@ -153,7 +151,6 @@ def scan_single_symbol(symbol, last_alerts):
         send_telegram_alert(msg)
         print(f"🔥 [SELL SIGNAL SENT FOR {symbol}!]")
 
-# ২৪/৭ মাল্টি-কয়েন স্ক্যানার থ্রেড
 def background_market_scanner():
     print("=" * 55)
     print("🚀 24/7 Multi-Coin SMC Cloud Scanner Started...")
@@ -166,6 +163,7 @@ def background_market_scanner():
         "• Bitcoin (BTCUSDT)\n"
         "• Ethereum (ETHUSDT)\n"
         "• Solana (SOLUSDT)\n"
+        "• Gold / Tether Gold (XAUTUSDT) 🥇\n"
         "• Mubarak (MUBARAKUSDT)\n\n"
         "📊 <b>লজিক:</b> 1H CRT + 5m MSS + 5m FVG\n"
         "⏰ প্রতি ক্যান্ডেলে সবকটি কয়েন স্ক্যান হচ্ছে—যেকোনোটিতে সুযোগ পেলেই সাথে সাথে অ্যালার্ট পাবেন!"
@@ -178,13 +176,12 @@ def background_market_scanner():
         try:
             for s in SYMBOLS:
                 scan_single_symbol(s, last_alerts)
-                time.sleep(2)  # প্রতিটি কয়েনের মাঝে সামান্য বিরতি
+                time.sleep(2)
         except Exception as e:
             print(f"[Multi-Scan Loop Error]: {e}")
             
         time.sleep(25)
 
-# অ্যাপ চালুর সাথে সাথে ব্যাকগ্রাউন্ডে মাল্টি-কয়েন স্ক্যানার চালু
 threading.Thread(target=background_market_scanner, daemon=True).start()
 
 if __name__ == '__main__':
