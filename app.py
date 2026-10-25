@@ -5,20 +5,22 @@ from datetime import datetime
 import threading
 from flask import Flask
 
-# ==================== টেলিগ্রাম ও মার্কেট কনফিগারেশন ====================
+# ==================== টেলিগ্রাম ও মাল্টি-কয়েন কনফিগারেশন ====================
 TELEGRAM_BOT_TOKEN = "8553506343:AAFUtxPSjXoC0H5ForsccaduEpsURMuUcaE"
 TELEGRAM_CHAT_ID = "5333453283"
-SYMBOL = "ETHUSDT"
+
+# আপনি যেসব কয়েন স্ক্যান করতে চান (এখানে আরও কয়েন যোগ করতে পারেন)
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "MUBARAKUSDT"]
+
 RRR = 2.0  # 1:2 Risk to Reward Ratio
 
 app = Flask(__name__)
 
-# হেলথ চেক রাউট (Render সার্ভার যাতে ২৪ ঘণ্টা জেগে থাকে)
 @app.route('/')
 def home():
-    return "🟢 ETH SMC Sniper 24/7 Cloud Bot is Running Successfully!"
+    pairs = ", ".join(SYMBOLS)
+    return f"🟢 Multi-Coin SMC Sniper Bot is Running 24/7! Scanning: {pairs}"
 
-# টেলিগ্রামে মেসেজ পাঠানো
 def send_telegram_alert(text_msg):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -33,132 +35,156 @@ def send_telegram_alert(text_msg):
         print(f"[Telegram Error]: {e}")
         return False
 
-# ফ্রি ক্যান্ডেল ডাটা ফেচ
-def get_klines(interval, limit):
+# Bybit পাবলিক API (আন্তর্জাতিক ও লাইভ ডেটা সোর্স)
+def get_klines(symbol, interval, limit=30):
     try:
-        url = f"https://api.binance.com/api/v3/klines?symbol={SYMBOL}&interval={interval}&limit={limit}"
+        # Bybit: 60 = 1 hour, 5 = 5 minutes
+        bybit_interval = "60" if interval == "1h" else "5"
+        url = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval={bybit_interval}&limit={limit}"
         headers = {"User-Agent": "Mozilla/5.0"}
         res = requests.get(url, headers=headers, timeout=10)
+        
         if res.status_code == 200:
-            candles = []
-            for d in res.json():
-                candles.append({
-                    "time": int(d[0]),
-                    "open": float(d[1]),
-                    "high": float(d[2]),
-                    "low": float(d[3]),
-                    "close": float(d[4])
-                })
-            return candles
+            data = res.json()
+            if data.get("retCode") == 0 and "list" in data.get("result", {}):
+                raw_list = data["result"]["list"]
+                raw_list.reverse()  # সময় অনুযায়ী ক্রমান্বয়ে সাজানো
+                candles = []
+                for d in raw_list:
+                    candles.append({
+                        "time": int(d[0]),
+                        "open": float(d[1]),
+                        "high": float(d[2]),
+                        "low": float(d[3]),
+                        "close": float(d[4])
+                    })
+                return candles
         return []
     except Exception as e:
-        print(f"[Data Error for {interval}]: {e}")
+        print(f"[Data Error for {symbol} - {interval}]: {e}")
         return []
 
-# ২৪/৭ লাইভ মার্কেট স্ক্যানার থ্রেড
+# একক কয়েন স্ক্যানিং ফাংশন
+def scan_single_symbol(symbol, last_alerts):
+    h1 = get_klines(symbol, "1h", 5)
+    m5 = get_klines(symbol, "5m", 25)
+    
+    if not (h1 and m5 and len(h1) >= 2 and len(m5) >= 10):
+        return
+        
+    prev_h1 = h1[-2]
+    h1_high = prev_h1["high"]
+    h1_low  = prev_h1["low"]
+    
+    closed_m5 = m5[:-1]
+    curr = closed_m5[-1]
+    curr_time = curr["time"]
+    
+    # 5m সুইং হাই ও লো (MSS)
+    recent_highs = [c["high"] for c in closed_m5[-6:-1]]
+    recent_lows  = [c["low"] for c in closed_m5[-6:-1]]
+    swing_high = max(recent_highs)
+    swing_low  = min(recent_lows)
+    
+    # 5m FVG
+    c0 = closed_m5[-1]
+    c2 = closed_m5[-3]
+    bullish_fvg = c0["low"] > c2["high"]
+    bearish_fvg = c0["high"] < c2["low"]
+    
+    # লিকুইডিটি সুইপ চেক (গত ৫টি ক্যান্ডেলে)
+    ssl_taken = False
+    bsl_taken = False
+    sweep_low = curr["low"]
+    sweep_high = curr["high"]
+    
+    for c in closed_m5[-5:]:
+        if c["low"] < h1_low and c["close"] > h1_low:
+            ssl_taken = True
+            sweep_low = min(sweep_low, c["low"])
+        if c["high"] > h1_high and c["close"] < h1_high:
+            bsl_taken = True
+            sweep_high = max(sweep_high, c["high"])
+            
+    mss_up = curr["close"] > swing_high
+    mss_down = curr["close"] < swing_low
+    
+    last_time = last_alerts.get(symbol, 0)
+    
+    # বাই সিগন্যাল
+    if ssl_taken and mss_up and bullish_fvg and curr_time != last_time:
+        last_alerts[symbol] = curr_time
+        entry = curr["close"]
+        sl = round(sweep_low * 0.999, 4)
+        tp = round(entry + ((entry - sl) * RRR), 4)
+        
+        msg = (
+            f"🟢 <b>[{symbol}] SMC BUY (LONG) SIGNAL!</b> 🎯\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"🪙 <b>Coin:</b> #{symbol}\n"
+            f"💵 <b>Entry Price:</b> ${entry}\n"
+            f"🛑 <b>Stop-Loss (SL):</b> ${sl}\n"
+            f"🎯 <b>Take-Profit (TP 1:2):</b> ${tp}\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 <b>কারণ:</b> 1H Low (${h1_low}) লিকুইডিটি সুইপ + 5m MSS + FVG!\n"
+            f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+        )
+        send_telegram_alert(msg)
+        print(f"🔥 [BUY SIGNAL SENT FOR {symbol}!]")
+        
+    # সেল সিগন্যাল
+    if bsl_taken and mss_down and bearish_fvg and curr_time != last_time:
+        last_alerts[symbol] = curr_time
+        entry = curr["close"]
+        sl = round(sweep_high * 1.001, 4)
+        tp = round(entry - ((sl - entry) * RRR), 4)
+        
+        msg = (
+            f"🔴 <b>[{symbol}] SMC SELL (SHORT) SIGNAL!</b> 🎯\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"🪙 <b>Coin:</b> #{symbol}\n"
+            f"💵 <b>Entry Price:</b> ${entry}\n"
+            f"🛑 <b>Stop-Loss (SL):</b> ${sl}\n"
+            f"🎯 <b>Take-Profit (TP 1:2):</b> ${tp}\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 <b>কারণ:</b> 1H High (${h1_high}) লিকুইডিটি সুইপ + 5m MSS + FVG!\n"
+            f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+        )
+        send_telegram_alert(msg)
+        print(f"🔥 [SELL SIGNAL SENT FOR {symbol}!]")
+
+# ২৪/৭ মাল্টি-কয়েন স্ক্যানার থ্রেড
 def background_market_scanner():
-    print("=" * 50)
-    print("🚀 24/7 Cloud Scanner Started...")
-    print("=" * 50)
+    print("=" * 55)
+    print("🚀 24/7 Multi-Coin SMC Cloud Scanner Started...")
+    print(f"Scanning Pairs: {', '.join(SYMBOLS)}")
+    print("=" * 55)
     
     welcome = (
-        "🌐 <b>ETH SMC Sniper 24/7 ক্লাউডে সক্রিয় হয়েছে!</b>\n\n"
-        "✅ আপনার ল্যাপটপ বন্ধ থাকলেও এই বট দিন-রাত ২৪ ঘণ্টা আপনার মোবাইলে সিগন্যাল পাঠাবে।\n"
-        "📊 <b>লজিক:</b> 1H CRT + 5m MSS + 5m FVG"
+        "🔥 <b>Multi-Coin SMC Sniper সক্রিয় হয়েছে!</b>\n\n"
+        "✅ <b>স্ক্যানিং পেয়ারসমূহ:</b>\n"
+        "• Bitcoin (BTCUSDT)\n"
+        "• Ethereum (ETHUSDT)\n"
+        "• Solana (SOLUSDT)\n"
+        "• Mubarak (MUBARAKUSDT)\n\n"
+        "📊 <b>লজিক:</b> 1H CRT + 5m MSS + 5m FVG\n"
+        "⏰ প্রতি ক্যান্ডেলে সবকটি কয়েন স্ক্যান হচ্ছে—যেকোনোটিতে সুযোগ পেলেই সাথে সাথে অ্যালার্ট পাবেন!"
     )
     send_telegram_alert(welcome)
     
-    last_alert_time = 0
+    last_alerts = {}
     
     while True:
         try:
-            h1 = get_klines("1h", 5)
-            m5 = get_klines("5m", 25)
-            
-            if h1 and m5 and len(h1) >= 2 and len(m5) >= 10:
-                prev_h1 = h1[-2]
-                h1_high = prev_h1["high"]
-                h1_low = prev_h1["low"]
-                
-                closed_m5 = m5[:-1]
-                curr = closed_m5[-1]
-                curr_time = curr["time"]
-                
-                # 5m সুইং হাই ও লো (MSS)
-                recent_highs = [c["high"] for c in closed_m5[-6:-1]]
-                recent_lows = [c["low"] for c in closed_m5[-6:-1]]
-                swing_high = max(recent_highs)
-                swing_low = min(recent_lows)
-                
-                # 5m FVG
-                c0 = closed_m5[-1]
-                c2 = closed_m5[-3]
-                bullish_fvg = c0["low"] > c2["high"]
-                bearish_fvg = c0["high"] < c2["low"]
-                
-                # সুইপ চেক
-                ssl_taken = False
-                bsl_taken = False
-                sweep_low = curr["low"]
-                sweep_high = curr["high"]
-                
-                for c in closed_m5[-5:]:
-                    if c["low"] < h1_low and c["close"] > h1_low:
-                        ssl_taken = True
-                        sweep_low = min(sweep_low, c["low"])
-                    if c["high"] > h1_high and c["close"] < h1_high:
-                        bsl_taken = True
-                        sweep_high = max(sweep_high, c["high"])
-                
-                mss_up = curr["close"] > swing_high
-                mss_down = curr["close"] < swing_low
-                
-                # বাই সিগন্যাল
-                if ssl_taken and mss_up and bullish_fvg and curr_time != last_alert_time:
-                    last_alert_time = curr_time
-                    entry = curr["close"]
-                    sl = round(sweep_low * 0.999, 2)
-                    tp = round(entry + ((entry - sl) * RRR), 2)
-                    
-                    msg = (
-                        "🟢 <b>ETH SMC BUY (LONG) SIGNAL!</b> 🎯\n"
-                        "━━━━━━━━━━━━━━━━━━━━\n"
-                        f"💵 <b>Entry Price:</b> ${entry}\n"
-                        f"🛑 <b>Stop-Loss (SL):</b> ${sl}\n"
-                        f"🎯 <b>Take-Profit (TP 1:2):</b> ${tp}\n"
-                        "━━━━━━━━━━━━━━━━━━━━\n"
-                        f"📌 1H Low (${h1_low}) লিকুইডিটি সুইপ + 5m MSS + FVG!\n"
-                        f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC"
-                    )
-                    send_telegram_alert(msg)
-                    print("🔥 [BUY SIGNAL SENT TO TELEGRAM!]")
-                
-                # সেল সিগন্যাল
-                if bsl_taken and mss_down and bearish_fvg and curr_time != last_alert_time:
-                    last_alert_time = curr_time
-                    entry = curr["close"]
-                    sl = round(sweep_high * 1.001, 2)
-                    tp = round(entry - ((sl - entry) * RRR), 2)
-                    
-                    msg = (
-                        "🔴 <b>ETH SMC SELL (SHORT) SIGNAL!</b> 🎯\n"
-                        "━━━━━━━━━━━━━━━━━━━━\n"
-                        f"💵 <b>Entry Price:</b> ${entry}\n"
-                        f"🛑 <b>Stop-Loss (SL):</b> ${sl}\n"
-                        f"🎯 <b>Take-Profit (TP 1:2):</b> ${tp}\n"
-                        "━━━━━━━━━━━━━━━━━━━━\n"
-                        f"📌 1H High (${h1_high}) লিকুইডিটি সুইপ + 5m MSS + FVG!\n"
-                        f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} UTC"
-                    )
-                    send_telegram_alert(msg)
-                    print("🔥 [SELL SIGNAL SENT TO TELEGRAM!]")
-                    
+            for s in SYMBOLS:
+                scan_single_symbol(s, last_alerts)
+                time.sleep(2)  # প্রতিটি কয়েনের মাঝে সামান্য বিরতি
         except Exception as e:
-            print(f"[Loop Error]: {e}")
+            print(f"[Multi-Scan Loop Error]: {e}")
             
-        time.sleep(30)
+        time.sleep(25)
 
-# অ্যাপ চালুর সাথে সাথে ব্যাকগ্রাউন্ডে স্ক্যানার চালু করা
+# অ্যাপ চালুর সাথে সাথে ব্যাকগ্রাউন্ডে মাল্টি-কয়েন স্ক্যানার চালু
 threading.Thread(target=background_market_scanner, daemon=True).start()
 
 if __name__ == '__main__':
